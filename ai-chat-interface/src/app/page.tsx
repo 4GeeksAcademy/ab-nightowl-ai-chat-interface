@@ -1,196 +1,363 @@
-export default function Home() {
-  const menuItems = [
-    "Optimizacion de Tokens",
-    "Arquitectura GPT-4",
-    "Analisis Predictivo",
-    "Configuracion de API",
-  ];
+"use client";
 
-  const bars = [38, 56, 22, 76, 48, 34];
+import { useEffect, useMemo, useRef, useState } from "react";
+
+type ChatRole = "user" | "assistant";
+
+type PersistedMessage = {
+  role: ChatRole;
+  content: string;
+};
+
+type ChatMessage = PersistedMessage & {
+  id: string;
+  createdAt: number;
+};
+
+type TokenMetrics = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  requestCount: number;
+  lastResponseMs: number | null;
+  totalResponseMs: number;
+  model: string;
+};
+
+type GroqCompletionResponse = {
+  model?: string;
+  choices?: Array<{
+    message?: {
+      content?: string;
+    };
+  }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+  error?: {
+    message?: string;
+  };
+};
+
+const STORAGE_KEY = "clarity-ai-chat-history-v1";
+const API_URL = "https://api.groq.com/openai/v1/chat/completions";
+const DEFAULT_MODEL = "llama-3.3-70b-versatile";
+
+const INITIAL_METRICS: TokenMetrics = {
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+  requestCount: 0,
+  lastResponseMs: null,
+  totalResponseMs: 0,
+  model: DEFAULT_MODEL,
+};
+
+const createMessage = (role: ChatRole, content: string): ChatMessage => ({
+  id: crypto.randomUUID(),
+  role,
+  content,
+  createdAt: Date.now(),
+});
+
+const loadStoredMessages = (): ChatMessage[] => {
+  if (typeof window === "undefined") {
+    return [];
+  }
+
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+
+    const parsed = JSON.parse(raw) as PersistedMessage[];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed
+      .filter(
+        (item) =>
+          item &&
+          (item.role === "user" || item.role === "assistant") &&
+          typeof item.content === "string" &&
+          item.content.trim().length > 0,
+      )
+      .map((item) => createMessage(item.role, item.content));
+  } catch {
+    localStorage.removeItem(STORAGE_KEY);
+    return [];
+  }
+};
+
+export default function Home() {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [metrics, setMetrics] = useState<TokenMetrics>(INITIAL_METRICS);
+  const [hasHydrated, setHasHydrated] = useState(false);
+
+  const endOfMessagesRef = useRef<HTMLDivElement | null>(null);
+
+  const apiKey = process.env.NEXT_PUBLIC_GROK_API_KEY;
+
+  useEffect(() => {
+    const frameId = window.requestAnimationFrame(() => {
+      setMessages(loadStoredMessages());
+      setHasHydrated(true);
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, []);
+
+  useEffect(() => {
+    if (!hasHydrated) {
+      return;
+    }
+
+    const payload: PersistedMessage[] = messages.map(({ role, content }) => ({ role, content }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+  }, [hasHydrated, messages]);
+
+  useEffect(() => {
+    endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isLoading]);
+
+  const averageResponseMs = useMemo(() => {
+    if (metrics.requestCount === 0) {
+      return null;
+    }
+
+    return Math.round(metrics.totalResponseMs / metrics.requestCount);
+  }, [metrics.totalResponseMs, metrics.requestCount]);
+
+  const handleClearConversation = () => {
+    setMessages([]);
+    setInput("");
+    setError(null);
+    setIsLoading(false);
+    setMetrics(INITIAL_METRICS);
+    localStorage.removeItem(STORAGE_KEY);
+  };
+
+  const handleSendMessage = async () => {
+    const cleanInput = input.trim();
+    if (!cleanInput || isLoading) {
+      return;
+    }
+
+    if (!apiKey) {
+      setError("Missing NEXT_PUBLIC_GROK_API_KEY. Add it to your environment variables.");
+      return;
+    }
+
+    const userMessage = createMessage("user", cleanInput);
+    const nextHistory = [...messages, userMessage];
+
+    setMessages(nextHistory);
+    setInput("");
+    setError(null);
+    setIsLoading(true);
+
+    const startedAt = performance.now();
+
+    try {
+      const response = await fetch(API_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: DEFAULT_MODEL,
+          messages: nextHistory.map(({ role, content }) => ({ role, content })),
+          temperature: 0.6,
+        }),
+      });
+
+      const data = (await response.json()) as GroqCompletionResponse;
+
+      if (!response.ok) {
+        const reason = data.error?.message ?? `Request failed with status ${response.status}.`;
+        throw new Error(reason);
+      }
+
+      const assistantText = data.choices?.[0]?.message?.content?.trim();
+      if (!assistantText) {
+        throw new Error("The model returned an empty answer. Please try again.");
+      }
+
+      setMessages((prev) => [...prev, createMessage("assistant", assistantText)]);
+
+      const promptTokens = data.usage?.prompt_tokens ?? 0;
+      const completionTokens = data.usage?.completion_tokens ?? 0;
+      const totalTokens = data.usage?.total_tokens ?? promptTokens + completionTokens;
+      const elapsedMs = Math.max(1, Math.round(performance.now() - startedAt));
+
+      setMetrics((prev) => ({
+        promptTokens: prev.promptTokens + promptTokens,
+        completionTokens: prev.completionTokens + completionTokens,
+        totalTokens: prev.totalTokens + totalTokens,
+        requestCount: prev.requestCount + 1,
+        lastResponseMs: elapsedMs,
+        totalResponseMs: prev.totalResponseMs + elapsedMs,
+        model: data.model || prev.model,
+      }));
+    } catch (caughtError) {
+      const message = caughtError instanceof Error ? caughtError.message : "Unexpected network error.";
+      setError(`Unable to get a response: ${message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-[#08132b] text-[#dbe6ff]">
-      <div className="mx-auto min-h-screen max-w-[1600px] border-x border-[#2b3e64]/80 lg:grid lg:grid-cols-[320px_1fr_380px]">
-        <aside className="border-b border-[#2b3e64]/80 bg-[#121f3f] lg:border-r lg:border-b-0">
-          <div className="flex h-full flex-col p-5 sm:p-6">
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top,#152956_0%,#0b1632_45%,#061029_100%)] text-[#dbe6ff]">
+      <div className="mx-auto grid min-h-screen max-w-[1500px] grid-cols-1 gap-4 p-4 lg:grid-cols-[1fr_360px] lg:p-6">
+        <main className="flex min-h-[80vh] flex-col overflow-hidden rounded-2xl border border-[#314d7d] bg-[#071432]/90">
+          <header className="flex flex-wrap items-center gap-3 border-b border-[#2b3e64]/80 px-5 py-4">
             <div>
-              <h1 className="text-2xl font-bold tracking-tight text-[#1fe2ff]">NEURAL_CORE</h1>
-              <p className="mt-1 font-mono text-sm text-[#95a9d4]">v2.4.0_STABLE</p>
+              <p className="font-mono text-xs uppercase tracking-[0.24em] text-[#6cc9ff]">Neural Core</p>
+              <h1 className="text-2xl font-semibold tracking-tight text-[#d7e4ff]">CLARITY_AI Chat</h1>
             </div>
-
-            <button className="mt-7 flex h-12 items-center justify-center gap-3 rounded-md border border-[#4f668f] bg-[#2b3658] px-4 text-sm font-medium text-[#18dffd] transition hover:bg-[#36456a]">
-              <span className="text-xl leading-none">+</span>
-              <span>New Chat</span>
-            </button>
-
-            <nav className="mt-7 space-y-2">
-              {menuItems.map((item) => (
-                <a
-                  key={item}
-                  href="#"
-                  className="flex items-center gap-3 rounded-md px-2 py-2 text-lg text-[#c9d7f2] transition hover:bg-[#1d2a4b]"
-                >
-                  <span className="h-5 w-5 rounded-sm border border-[#5e739a]" />
-                  <span>{item}</span>
-                </a>
-              ))}
-            </nav>
-
-            <div className="mt-auto space-y-2 pt-8">
-              <a href="#" className="flex items-center gap-3 rounded-md px-2 py-2 text-xl text-[#d1defa] hover:bg-[#1d2a4b]">
-                <span className="h-5 w-5 rounded-full border border-[#5e739a]" />
-                <span>Help</span>
-              </a>
-              <a href="#" className="flex items-center gap-3 rounded-md px-2 py-2 text-xl text-[#d1defa] hover:bg-[#1d2a4b]">
-                <span className="h-5 w-5 rounded-sm border border-[#5e739a]" />
-                <span>Logout</span>
-              </a>
+            <div className="ml-auto flex items-center gap-2 rounded-full border border-[#3f5f90] bg-[#102349] px-4 py-1.5 font-mono text-xs text-[#cde0ff]">
+              Total Session Tokens: {metrics.totalTokens.toLocaleString()}
             </div>
-
-            <button className="mt-5 h-11 rounded-md border border-[#45eefe]/60 bg-[#19d8f5] font-mono text-xs font-semibold tracking-wider text-[#0d2c4b] transition hover:brightness-110">
-              UPGRADE_PLAN
+            <button
+              type="button"
+              onClick={handleClearConversation}
+              className="rounded-md border border-[#4f668f] bg-[#1b2e57] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-[#d2e2ff] transition hover:bg-[#264071]"
+            >
+              Clear Conversation
             </button>
-          </div>
-        </aside>
+          </header>
 
-        <main className="border-b border-[#2b3e64]/80 bg-[#061137] lg:border-r lg:border-b-0">
-          <div className="flex h-full flex-col">
-            <header className="flex flex-wrap items-center gap-4 border-b border-[#2b3e64]/80 px-5 py-4 sm:px-7">
-              <h2 className="text-4xl font-bold tracking-tight text-[#d7e4ff]">CLARITY_AI</h2>
-              <nav className="flex items-center gap-6 font-mono text-sm uppercase text-[#b0c3e8]">
-                <a href="#" className="border-b-2 border-[#1ce4ff] pb-1 text-[#1ce4ff]">
-                  Models
-                </a>
-                <a href="#" className="hover:text-white">
-                  API
-                </a>
-                <a href="#" className="hover:text-white">
-                  Docs
-                </a>
-              </nav>
-              <div className="ml-auto flex items-center gap-3">
-                <div className="rounded-full border border-[#446086] bg-[#1b2949] px-4 py-2 font-mono text-sm text-[#c8dafd]">
-                  Token Metrics: 2.4k
-                </div>
-                <span className="h-7 w-7 rounded-full border border-[#56749d]" />
-                <span className="h-7 w-7 rounded-full border border-[#56749d]" />
-              </div>
-            </header>
-
-            <section className="flex-1 space-y-6 overflow-y-auto px-5 py-6 sm:px-7">
-              <article className="space-y-3">
-                <div className="flex items-center gap-3">
-                  <span className="h-10 w-10 rounded-sm bg-[#16dcfb]" />
-                  <p className="font-mono text-xl uppercase tracking-wide text-[#d7e6ff]">SYSTEM_READY</p>
-                </div>
-                <p className="max-w-[96%] text-lg leading-relaxed text-[#dce7ff]">
-                  Hola. Soy tu asistente NEURAL_CORE. He analizado tu solicitud sobre la gestion de tokens. Como puedo ayudarte a optimizar tu flujo de trabajo hoy? Podemos revisar el historial de consumo o ajustar los parametros del modelo.
+          <section className="flex-1 overflow-y-auto px-4 py-5 sm:px-6">
+            {messages.length === 0 && (
+              <div className="rounded-2xl border border-[#2f4b78] bg-[#0f2047]/80 p-5 text-[#d4e5ff]">
+                <p className="font-mono text-xs uppercase tracking-[0.2em] text-[#65d9ff]">System Ready</p>
+                <p className="mt-3 text-sm leading-relaxed sm:text-base">
+                  Ask anything about token strategy, model behavior, or implementation details. Full conversation history is
+                  sent on each request.
                 </p>
-              </article>
-
-              <div className="flex justify-end">
-                <div className="max-w-[92%] rounded-2xl border border-[#4b648f] bg-[#2a3658] px-7 py-5 text-lg leading-relaxed text-[#d8e5ff]">
-                  Puedes darme un desglose de los tokens utilizados en el ultimo analisis tecnico?
-                </div>
               </div>
+            )}
 
-              <article className="space-y-4">
-                <div className="flex items-center gap-3">
-                  <span className="h-10 w-10 rounded-sm bg-[#16dcfb]" />
-                  <p className="font-mono text-xl uppercase tracking-wide text-[#d7e6ff]">PROCESSING_TOKEN</p>
-                </div>
+            <div className="mt-4 space-y-4">
+              {messages.map((message) => {
+                const isUser = message.role === "user";
 
-                <p className="text-lg text-[#dce7ff]">Entendido. Aqui tienes el desglose tecnico de la ultima sesion:</p>
+                return (
+                  <article key={message.id} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+                    <div
+                      className={`max-w-[90%] rounded-2xl border px-4 py-3 text-sm leading-relaxed sm:max-w-[80%] sm:text-base ${
+                        isUser
+                          ? "border-[#4b648f] bg-[#2a3658] text-[#dce7ff]"
+                          : "border-[#325381] bg-[#101f45] text-[#e4eeff]"
+                      }`}
+                    >
+                      <p className="mb-1 font-mono text-[10px] uppercase tracking-[0.18em] text-[#82c6ff]">
+                        {isUser ? "You" : "Assistant"}
+                      </p>
+                      <p className="whitespace-pre-wrap break-words">{message.content}</p>
+                    </div>
+                  </article>
+                );
+              })}
 
-                <div className="overflow-hidden rounded-2xl border border-[#415b86] bg-[#0d1835]">
-                  <div className="flex items-center justify-between border-b border-[#4b648f] bg-[#323d5f] px-5 py-3">
-                    <span className="font-mono text-xl uppercase tracking-wide text-[#d1e0fc]">JSON_OUTPUT</span>
-                    <button className="font-mono text-xl uppercase tracking-wide text-[#d1e0fc]">COPY</button>
+              {isLoading && (
+                <article className="flex justify-start">
+                  <div className="max-w-[90%] rounded-2xl border border-[#325381] bg-[#101f45] px-4 py-3 text-sm text-[#d7e8ff] sm:max-w-[80%] sm:text-base">
+                    <p className="mb-1 font-mono text-[10px] uppercase tracking-[0.18em] text-[#82c6ff]">Assistant</p>
+                    <p>Thinking...</p>
                   </div>
-                  <pre className="overflow-x-auto bg-black px-5 py-5 font-mono text-base leading-relaxed text-[#31f1c5]">{`{
-  "request_id": "nc_89234x",
-  "tokens_prompt": 452,
-  "tokens_completion": 890,
-  "total_tokens": 1342,
-  "cost_usd": 0.00268
-}`}</pre>
-                </div>
+                </article>
+              )}
 
-                <p className="text-lg text-[#dce7ff]">El consumo fue eficiente debido a la compresion de contexto aplicada.</p>
-              </article>
-            </section>
+              <div ref={endOfMessagesRef} />
+            </div>
+          </section>
 
-            <footer className="border-t border-[#2b3e64]/80 px-5 py-5 sm:px-7">
-              <div className="rounded-2xl border border-[#425c84] bg-[#141f41] p-4">
-                <textarea
-                  className="h-36 w-full resize-none bg-transparent text-lg text-[#dce8ff] outline-none placeholder:text-[#95abd3]"
-                  placeholder="Describe tu consulta de IA aqui..."
-                />
-                <div className="mt-4 flex items-center justify-between">
-                  <div className="flex items-center gap-3 text-[#c6d8fa]">
-                    <span className="h-8 w-8 rounded-md border border-[#5e739a]" />
-                    <span className="h-8 w-8 rounded-md border border-[#5e739a]" />
-                  </div>
-                  <button className="h-12 min-w-[220px] rounded-2xl border border-[#48f1ff]/70 bg-[#1adcf8] px-6 font-mono text-sm font-semibold tracking-wide text-[#082847] transition hover:brightness-110">
-                    ENVIAR_PROMPT
-                  </button>
-                </div>
+          <footer className="border-t border-[#2b3e64]/80 px-4 py-4 sm:px-6">
+            {error && (
+              <div className="mb-3 rounded-lg border border-[#9b4b5f] bg-[#3d1926] px-3 py-2 text-sm text-[#ffd8de]">
+                {error}
               </div>
-            </footer>
-          </div>
+            )}
+
+            <div className="rounded-xl border border-[#425c84] bg-[#131f42] p-3">
+              <textarea
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void handleSendMessage();
+                  }
+                }}
+                className="h-28 w-full resize-none bg-transparent text-sm text-[#dce8ff] outline-none placeholder:text-[#95abd3] sm:text-base"
+                placeholder="Describe your AI request here..."
+                disabled={isLoading}
+              />
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#8ca8d6]">
+                  Enter to send, Shift+Enter for newline
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleSendMessage();
+                  }}
+                  disabled={isLoading || input.trim().length === 0}
+                  className="h-11 min-w-[170px] rounded-xl border border-[#48f1ff]/70 bg-[#1adcf8] px-6 font-mono text-xs font-semibold uppercase tracking-[0.12em] text-[#082847] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {isLoading ? "Sending..." : "Send Prompt"}
+                </button>
+              </div>
+            </div>
+          </footer>
         </main>
 
-        <aside className="bg-[#0c1738] px-5 py-6">
-          <div className="space-y-6">
-            <h3 className="font-mono text-xl uppercase tracking-wide text-[#d8e6ff]">ESTADISTICAS DE TOKEN</h3>
+        <aside className="rounded-2xl border border-[#314d7d] bg-[#0c1738]/95 p-5">
+          <div className="space-y-5">
+            <h2 className="font-mono text-sm uppercase tracking-[0.18em] text-[#9ec6ff]">Token Metrics</h2>
 
-            <section className="rounded-2xl border border-[#405b86] bg-[#101f42] p-5">
-              <p className="font-mono text-xl uppercase tracking-wide text-[#bbceef]">Tokens Usados (Hoy)</p>
-              <p className="mt-2 text-5xl font-bold text-[#d4e3ff]">145,280</p>
-              <p className="mt-2 text-2xl text-[#41efca]">+12% vs. ayer</p>
+            <section className="rounded-xl border border-[#3d5a86] bg-[#101f42] p-4">
+              <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#bcd1f5]">Prompt Tokens</p>
+              <p className="mt-2 text-3xl font-semibold text-[#e0ebff]">{metrics.promptTokens.toLocaleString()}</p>
             </section>
 
-            <section className="rounded-2xl border border-[#405b86] bg-[#101f42] p-5">
-              <div className="mb-3 flex items-center justify-between">
-                <p className="font-mono text-xl uppercase tracking-wide text-[#caddff]">Presupuesto Diario</p>
-                <span className="font-mono text-xl text-[#d8e6ff]">72%</span>
-              </div>
-              <div className="h-3 w-full overflow-hidden rounded-full bg-[#2a3858]">
-                <div className="h-full w-[72%] bg-[#1fe2fb]" />
-              </div>
-              <p className="mt-3 text-xl italic text-[#b5caed]">Limite: 200,000 tokens</p>
+            <section className="rounded-xl border border-[#3d5a86] bg-[#101f42] p-4">
+              <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#bcd1f5]">Completion Tokens</p>
+              <p className="mt-2 text-3xl font-semibold text-[#e0ebff]">{metrics.completionTokens.toLocaleString()}</p>
             </section>
 
-            <section className="rounded-2xl border border-[#405b86] bg-[#101f42] p-5">
-              <p className="font-mono text-xl uppercase tracking-wide text-[#caddff]">Consumo por Mensaje</p>
-              <div className="mt-4 flex h-32 items-end justify-between gap-2">
-                {bars.map((height, index) => (
-                  <div
-                    key={height}
-                    className={`w-full rounded-t-sm ${index === 4 ? "bg-[#1adcf8]" : "bg-[#4f637d]"}`}
-                    style={{ height: `${height}%` }}
-                  />
-                ))}
-              </div>
-              <div className="mt-3 grid grid-cols-6 text-center font-mono text-sm text-[#95abd2]">
-                <span>M-5</span>
-                <span>M-4</span>
-                <span>M-3</span>
-                <span>M-2</span>
-                <span>AHORA</span>
-                <span>PROX</span>
-              </div>
+            <section className="rounded-xl border border-[#3d5a86] bg-[#101f42] p-4">
+              <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#bcd1f5]">Total Tokens</p>
+              <p className="mt-2 text-3xl font-semibold text-[#e0ebff]">{metrics.totalTokens.toLocaleString()}</p>
             </section>
 
-            <section className="mt-8 border-t border-[#2f4368] pt-6">
-              <p className="font-mono text-xl uppercase tracking-wide text-[#d4e3ff]">Costo Estimado</p>
-              <p className="mt-2 text-5xl font-bold text-[#4bf2c7]">$34.12 USD</p>
-              <button className="mt-5 h-12 w-full rounded-xl border border-[#48618b] bg-[#2d3959] font-mono text-sm font-semibold tracking-wide text-[#dbe9ff] transition hover:bg-[#38496c]">
-                GESTIONAR_FACTURACION
-              </button>
+            <section className="rounded-xl border border-[#3d5a86] bg-[#101f42] p-4">
+              <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#bcd1f5]">Additional Metrics</p>
+              <div className="mt-3 space-y-2 text-sm text-[#d4e4ff]">
+                <p>
+                  Model: <span className="text-[#79e8ff]">{metrics.model}</span>
+                </p>
+                <p>
+                  Last Response Time: <span className="text-[#79e8ff]">{metrics.lastResponseMs ?? "-"} ms</span>
+                </p>
+                <p>
+                  Requests Completed: <span className="text-[#79e8ff]">{metrics.requestCount}</span>
+                </p>
+                <p>
+                  Avg ms/request: <span className="text-[#79e8ff]">{averageResponseMs ?? "-"}</span>
+                </p>
+              </div>
             </section>
-
-            <div className="h-40 rounded-2xl border border-[#2f4368] bg-[radial-gradient(circle_at_45%_35%,#2a3f63_0%,#0d1733_55%,#091127_100%)]" />
           </div>
         </aside>
       </div>
